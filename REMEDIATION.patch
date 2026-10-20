@@ -1,0 +1,94 @@
+diff --git a/src/helpdesk/views/staff.py b/src/helpdesk/views/staff.py
+index de7cd64..904107a 100644
+--- a/src/helpdesk/views/staff.py
++++ b/src/helpdesk/views/staff.py
+@@ -515,6 +515,12 @@ def get_attachments_for_ticket(ticket):
+ def view_ticket(request, ticket_id):
+     ticket = get_object_or_404(Ticket, id=ticket_id)
+ 
++    # Object-level access control (fixes IDOR / A1): being signed-in staff is not
++    # enough - the agent must be allowed the queue this ticket belongs to (or be
++    # assigned to it). Without this check any guessable id disclosed the record.
++    if not HelpdeskUser(request.user).can_access_ticket(ticket):
++        raise PermissionDenied()
++
+     if "take" in request.GET:
+         update_ticket(request.user, ticket, owner=request.user.id)
+         return return_to_ticket(request.user, ticket)
+@@ -1414,9 +1420,14 @@ def claim_ticket(request, ticket_id):
+     return JsonResponse({"result": "already_claimed", "by": current.username})
+ 
+ 
+-@helpdesk_staff_member_required
++@superuser_required
+ def promote_user(request):
+-    """Grant a user administrator rights."""
++    """Grant a user administrator rights.
++
++    Fixes vertical privilege escalation (A2): this administrative action now
++    requires an existing administrator (@superuser_required), not merely staff,
++    so a plain agent can no longer grant superuser rights.
++    """
+     target = request.GET.get("user", "")
+     user = get_object_or_404(User, username=target)
+     user.is_superuser = True
+@@ -1425,10 +1436,15 @@ def promote_user(request):
+     return JsonResponse({"user": user.username, "is_superuser": user.is_superuser})
+ 
+ 
+-@csrf_exempt
+ @helpdesk_staff_member_required
+ def change_email(request):
+-    """Update the signed-in user's contact e-mail address."""
++    """Update the signed-in user's contact e-mail address.
++
++    Fixes CSRF (A3): the @csrf_exempt that disabled Django's token protection
++    has been removed, so this state-changing POST now requires a valid CSRF
++    token and the framework also verifies the request Origin/Referer against
++    CSRF_TRUSTED_ORIGINS. A tokenless cross-site POST is now rejected (403).
++    """
+     if request.method != "POST":
+         return JsonResponse({"detail": "POST required"}, status=405)
+     new_email = request.POST.get("email", "")
+@@ -1518,17 +1534,34 @@ def export_ticket(request, ticket_id):
+     Agents use this to keep an offline copy. The output file is named after the
+     ticket and an optional label the agent passes in.
+     """
+-    import subprocess
++    import os
+ 
+     ticket = get_object_or_404(Ticket, id=ticket_id)
+-    label = request.GET.get("label", "")
+-    name = f"ticket-{ticket_id}" + (f"-{label}" if label else "")
+-    body = f"#{ticket.id} {ticket.title} [{ticket.get_status_display()}]\\n\\n{ticket.description or ''}\\n"
++    # Object-level access control (fixes the Finale's missing object check): the
++    # export must honour the same queue boundary as viewing a ticket.
++    if not HelpdeskUser(request.user).can_access_ticket(ticket):
++        raise PermissionDenied()
+ 
+-    command = f"mkdir -p /tmp/exports && printf %s {json.dumps(body)} > /tmp/exports/{name}.txt && cat /tmp/exports/{name}.txt"
+-    output = subprocess.check_output(
+-        command, shell=True, stderr=subprocess.STDOUT
++    label = request.GET.get("label", "")
++    # Fixes command injection (B5-B7): the label only ever names a file, it is
++    # never part of a shell string. Restrict it to a safe character set and strip
++    # any path component, then do pure Python file I/O - no shell is constructed,
++    # so metacharacters such as ; | && # can never be parsed as commands.
++    safe_label = re.sub(r"[^A-Za-z0-9._-]", "_", label)
++    name = f"ticket-{ticket_id}" + (f"-{safe_label}" if safe_label else "")
++
++    body = (
++        f"#{ticket.id} {ticket.title} [{ticket.get_status_display()}]\n\n"
++        f"{ticket.description or ''}\n"
+     )
++
++    export_dir = "/tmp/exports"
++    os.makedirs(export_dir, exist_ok=True)
++    path = os.path.join(export_dir, f"{name}.txt")
++    with open(path, "w", encoding="utf-8") as handle:
++        handle.write(body)
++    with open(path, "r", encoding="utf-8") as handle:
++        output = handle.read()
+     return HttpResponse(output, content_type="text/plain")
+ 
+ 
